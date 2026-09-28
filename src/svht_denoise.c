@@ -31,7 +31,7 @@ static const char *pf_note(double pf) {
 }
 #endif
 
-#define DN_VERSION "0.1.20260813"
+#define DN_VERSION "0.1.20260928"
 
 // -degibbs: no, yes (after denoising), or only (instead of denoising).
 enum { DN_DG_NO = 0, DN_DG_YES, DN_DG_ONLY };
