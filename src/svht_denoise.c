@@ -572,16 +572,8 @@ int main(int argc, char *argv[]) {
 	}
 #endif
 
-	const int auto_extent = dn_auto_extent(img.nvol);
 	const int extent_was_auto = !extent_given;
-	if (!extent_given) {
-		extent = auto_extent;
-		if (extent == 0) {
-			dn_err("no patch size up to %d fits %d volumes (needs k^3 > N)\n",
-			       DN_MAX_EXTENT, img.nvol);
-			goto done;
-		}
-	}
+	if (!extent_given) extent = dn_auto_extent(img.nvol);
 
 	dn_geom g;
 	if (dn_geom_init(&g, img.nx, img.ny, img.nz, img.nvol, extent)) goto done;

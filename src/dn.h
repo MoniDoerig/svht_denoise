@@ -26,8 +26,12 @@ extern "C" {
 // gigabyte per thread; anything approaching this is a user error, not a workload.
 #define DN_MAX_VOL 4096
 
-// Largest patch side length.  k = 15 is 3375 voxels, far past anything useful.
-#define DN_MAX_EXTENT 15
+// Largest patch side length.  Must satisfy k^3 > DN_MAX_VOL so every admissible
+// series has an auto extent; 27 (19683 voxels) leaves room for explicit -extent.
+#define DN_MAX_EXTENT 27
+#if DN_MAX_EXTENT * DN_MAX_EXTENT * DN_MAX_EXTENT <= DN_MAX_VOL
+#error "DN_MAX_EXTENT^3 must exceed DN_MAX_VOL"
+#endif
 
 // Checked size arithmetic.  Adapted from niimath's nii_mul_size (core.c, BSD-2,
 // rordenlab/niimath).  Returns 1 on overflow, 0 on success.

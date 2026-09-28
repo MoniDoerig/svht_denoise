@@ -36,8 +36,8 @@ typedef struct {
 // success; on failure the reason has already been reported.
 int dn_geom_init(dn_geom *g, int nx, int ny, int nz, int nvol, int extent);
 
-// The default extent: the smallest odd k with k*k*k > nvol.  Returns 0 if no
-// admissible k exists within DN_MAX_EXTENT.
+// The default extent: the smallest odd k with k*k*k > nvol.  Always found for
+// nvol <= DN_MAX_VOL; dn.h enforces that at compile time.
 int dn_auto_extent(int nvol);
 
 // Per-worker scratch.  One arena per thread; nothing here is shared.
