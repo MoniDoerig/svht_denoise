@@ -51,10 +51,16 @@ check_collision() {
 	else bad "$name (exit $got, and no collision refusal)"; sed 's/^/       /' "$WORK/stderr"; fi
 }
 
+# Relative L2 error of an output against its noise-free truth.
+err() { "$GEN" rl2 "$1" "$2" 1 | awk '{print $2}'; }
+
 for k in mag mask phase-rad phase-int phase-turns phase-deg phase-affine phase-const phase-siemens; do
 	"$GEN" mk "$k" "$WORK/$k.nii" || { echo "fixture $k failed"; exit 1; }
 done
 M=$WORK/mag.nii
+# The original pipeline.  Sections pinned before the defaults changed run with
+# it, then override the one setting they test (the last value of an option wins).
+LEGACY="-filter optthresh -aggregator exclusive -shape cube -vst n"
 
 echo "path safety"
 # An output must never land on an input or on another output.  Each of these
@@ -219,7 +225,7 @@ check "phase with a NaN sform"   1 "$BIN" "$M" "$WORK/o.nii" -quiet -phase "$WOR
 echo "phase units"
 # Every encoding is the SAME phase field, so all must give the same rotation.
 for u in rad int turns deg; do
-	check "rotate phase-$u"      0 "$BIN" "$M" "$WORK/d_$u.nii" -quiet \
+	check "rotate phase-$u"      0 "$BIN" "$M" "$WORK/d_$u.nii" $LEGACY -quiet \
 		-phase "$WORK/phase-$u.nii" -real "$WORK/rot_$u.nii"
 done
 for u in int turns deg; do
@@ -292,7 +298,7 @@ fi
 # nothing else inspects them: either write could be deleted and the suite stayed
 # green.  This run also pins dn_write_*'s "safe to call in any order" claim,
 # which no other test reaches -- nothing else asks for more than two outputs.
-check "all four outputs in one run" 0 "$BIN" "$M" "$WORK/all.nii" -quiet \
+check "all four outputs in one run" 0 "$BIN" "$M" "$WORK/all.nii" $LEGACY -quiet \
 	-phase "$WORK/phase-rad.nii" -noise "$WORK/all_n.nii" \
 	-rank "$WORK/all_r.nii" -real "$WORK/all_re.nii"
 if [ -s "$WORK/all_n.nii" ] && [ -s "$WORK/all_r.nii" ] && [ -s "$WORK/all_re.nii" ]
@@ -359,7 +365,7 @@ echo "split eigensolver path"
 # have ZERO coverage, and on this one they have 81-92% while tred2 has none.
 # The two fixtures are complementary, which is why both stay.
 "$GEN" mk big48 "$WORK/big48.nii" || { echo "fixture big48 failed"; exit 1; }
-check "48-volume run" 0 "$BIN" "$WORK/big48.nii" "$WORK/b48.nii" -quiet -rank "$WORK/b48_r.nii"
+check "48-volume run" 0 "$BIN" "$WORK/big48.nii" "$WORK/b48.nii" $LEGACY -quiet -rank "$WORK/b48_r.nii"
 # Ranks are integers, so a NON-INTEGER rank-map RMS is by itself proof that the
 # map varies.  That matters: a run that retained nothing anywhere would exit 0
 # with dn_eig_vectors never entered, and one constant rank would satisfy any
@@ -373,12 +379,12 @@ else bad "split-path denoised RMS moved: $("$GEN" rms "$WORK/b48.nii" 0 0 2>/dev
 # The byte-identity promise, on the path where the eigenvectors are built one at
 # a time and re-orthogonalised against their predecessors.  The 8-volume case
 # below never reaches that code.
-check "48-volume, 1 thread"      0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t1.nii" -nthreads 1 -quiet
+check "48-volume, 1 thread"      0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t1.nii" $LEGACY -nthreads 1 -quiet
 # NOT -quiet, and the worker count is read back, for the same reason the
 # determinism section below does it: dn_effective_threads caps by DN_CHUNK-sized
 # chunks and by the core count, so on a one-core host "-nthreads 8" means 1 and
 # the comparison below would be a serial run against itself, reporting success.
-check "48-volume, many threads"  0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t8.nii" -nthreads 8
+check "48-volume, many threads"  0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t8.nii" $LEGACY -nthreads 8
 sv_n=$(sed -n 's/.*threads *: *//p' "$WORK/stderr")
 if [ "${sv_n:-1}" -gt 1 ]
 then ok "the multi-thread split run really used $sv_n workers"
@@ -404,8 +410,8 @@ echo "determinism"
 # already means 4 -- and on a one-core host it means 1, at which point the
 # comparison below is a serial run against itself.  Measured: forcing
 # dn_default_threads() to 1 left the whole suite green.
-check "run, 1 thread"            0 "$BIN" "$M" "$WORK/t1.nii" -nthreads 1 -phase "$WORK/phase-rad.nii"
-check "run, many threads"        0 "$BIN" "$M" "$WORK/t8.nii" -nthreads 8 -phase "$WORK/phase-rad.nii"
+check "run, 1 thread"            0 "$BIN" "$M" "$WORK/t1.nii" $LEGACY -nthreads 1 -phase "$WORK/phase-rad.nii"
+check "run, many threads"        0 "$BIN" "$M" "$WORK/t8.nii" $LEGACY -nthreads 8 -phase "$WORK/phase-rad.nii"
 sv_n=$(sed -n 's/.*threads *: *//p' "$WORK/stderr")
 if [ "${sv_n:-1}" -gt 1 ]
 then ok "the multi-thread run really used $sv_n workers"
@@ -552,6 +558,227 @@ if [ "$sv_rc" -eq 1 ]; then ok "-degibbs o changed the image"
 elif [ "$sv_rc" -eq 0 ]; then bad "-degibbs o returned its input unchanged"
 else bad "degibbs comparison failed to run (cmp exit $sv_rc)"; fi
 fi
+
+echo "per-shell demeaning"
+# The sidecar is found by name.  Shells: b=0 x2, 1000 x3, 2000 x2; the lone 3000
+# is a shell of one and must NOT be demeaned, so G = 3.
+sv_d=$WORK/dm; mkdir -p "$sv_d"; cp "$M" "$sv_d/mag.nii"
+echo "0 5 995 1000 1005 2000 2010 3000" > "$sv_d/mag.bval"
+check_msg "-demean y finds the sidecar, clusters 3 shells" "b=1000 x3 b=2005 x2" \
+	"$BIN" "$sv_d/mag.nii" "$WORK/dm.nii" $LEGACY -demean y -nthreads 1 -noise "$WORK/dm_s.nii"
+check "-demean y, many threads"   0 "$BIN" "$sv_d/mag.nii" "$WORK/dm8.nii" $LEGACY -quiet -demean y -nthreads 8
+if cmp -s "$WORK/dm.nii" "$WORK/dm8.nii"
+then ok "demean: 1 thread == 8 threads, byte for byte"; else bad "demean: thread count changed the output"; fi
+# Pinned: beta must count N-G columns, and the means must be restored.  Getting
+# either wrong moves this, where a self-consistency check would not notice.
+check "demeaned RMS is unchanged" 0 "$GEN" rms "$WORK/dm.nii" 614.498087 1e-6
+# The output alone does not notice beta counting N instead of N-G on this
+# fixture (mutation-tested); sigma depends on beta directly, so pin it too.
+check "demeaned noise RMS is unchanged" 0 "$GEN" rms "$WORK/dm_s.nii" 30.3373923 1e-6
+check "-demean n ignores a sidecar" 0 "$BIN" "$sv_d/mag.nii" "$WORK/dmn.nii" $LEGACY -quiet -demean n
+"$BIN" "$M" "$WORK/plain.nii" $LEGACY -quiet
+if cmp -s "$WORK/dmn.nii" "$WORK/plain.nii"
+then ok "-demean n == no demeaning, byte for byte"; else bad "-demean n changed the output"; fi
+echo "0 0 1000" > "$sv_d/short.bval"
+# MRtrix3 shares a shell only BELOW 80 s/mm^2 apart, so 1000 and 1080 split.
+echo "0 0 1000 1000 1080 1080 2000 2000" > "$sv_d/edge.bval"
+check_msg "a gap of exactly 80 starts a shell" "4 shells" \
+	"$BIN" "$sv_d/mag.nii" "$WORK/edge.nii" $LEGACY -demean y -bval "$sv_d/edge.bval"
+check "-bval with the wrong count"  1 "$BIN" "$sv_d/mag.nii" "$WORK/x.nii" -quiet -demean y -bval "$sv_d/short.bval"
+check "-demean y with no b-values"  1 "$BIN" "$M" "$WORK/x.nii" -quiet -demean y
+check "-bval without -demean y"     1 "$BIN" "$sv_d/mag.nii" "$WORK/x.nii" -quiet -bval "$sv_d/mag.bval"
+
+echo "sigma-based filters"
+# big48 is low rank plus noise ramped across x, and big48-clean is its truth, so
+# a filter's error can be measured rather than only pinned.
+"$GEN" mk big48 "$WORK/f48.nii" && "$GEN" mk big48-clean "$WORK/f48c.nii" || { echo "fixture big48-clean failed"; exit 1; }
+for sv_f in optthresh truncate optshrink; do
+	check "-filter $sv_f runs" 0 "$BIN" "$WORK/f48.nii" "$WORK/f_$sv_f.nii" $LEGACY -quiet -filter "$sv_f" \
+		-nthreads 1 -noise "$WORK/fs_$sv_f.nii"
+done
+# The point of shrinkage: closer to the truth than the hard threshold it replaces.
+sv_e1=$(err "$WORK/f_optthresh.nii" "$WORK/f48c.nii")
+sv_e2=$(err "$WORK/f_optshrink.nii" "$WORK/f48c.nii")
+if awk "BEGIN{exit !($sv_e2 < $sv_e1)}"
+then ok "optshrink beats optthresh against the truth ($sv_e2 < $sv_e1)"
+else bad "optshrink error $sv_e2 is not below optthresh's $sv_e1"; fi
+# Pinned, because the comparison above survives many wrong shrinkers.  The noise
+# map is the pass-1 estimate, shared by both sigma-based filters.
+check "optshrink RMS is unchanged"  0 "$GEN" rms "$WORK/f_optshrink.nii" 1050.76197 1e-6
+check "truncate RMS is unchanged"   0 "$GEN" rms "$WORK/f_truncate.nii" 1076.92601 1e-6
+check "sigma map RMS is unchanged"  0 "$GEN" rms "$WORK/fs_optshrink.nii" 326.854857 1e-6
+check "-filter optshrink, many threads" 0 "$BIN" "$WORK/f48.nii" "$WORK/f_os8.nii" $LEGACY -quiet -filter optshrink -nthreads 8
+if cmp -s "$WORK/f_optshrink.nii" "$WORK/f_os8.nii"
+then ok "optshrink: 1 thread == 8 threads, byte for byte"; else bad "optshrink: thread count changed the output"; fi
+check "-filter with a bad name"      1 "$BIN" "$M" "$WORK/x.nii" -quiet -filter median
+
+echo "spherical patch"
+# Measured in mm: on 1 x 1 x 2.5 mm voxels the 27-voxel ball reaches two voxels
+# in-plane but one through-plane, so it closes at sqrt(2.5^2 + 1) with 31.
+"$GEN" mk mag-aniso "$WORK/aniso.nii" || { echo "fixture mag-aniso failed"; exit 1; }
+check_msg "sphere on isotropic voxels"   "radius 1.73 mm = 27 voxels" "$BIN" "$M" "$WORK/sp.nii" $LEGACY -shape sphere -nthreads 1
+check_msg "sphere on anisotropic voxels" "radius 2.69 mm = 31 voxels" "$BIN" "$WORK/aniso.nii" "$WORK/spa.nii" $LEGACY -shape sphere
+check "sphere RMS is unchanged"          0 "$GEN" rms "$WORK/sp.nii" 614.250794 1e-6
+check "sphere on 8 threads"              0 "$BIN" "$M" "$WORK/sp8.nii" $LEGACY -quiet -shape sphere -nthreads 8
+if cmp -s "$WORK/sp.nii" "$WORK/sp8.nii"
+then ok "sphere: 1 thread == 8 threads, byte for byte"; else bad "sphere: thread count changed the output"; fi
+check "sphere + optshrink on big48"      0 "$BIN" "$WORK/f48.nii" "$WORK/spf.nii" $LEGACY -quiet -shape sphere \
+	-filter optshrink -nthreads 1 -noise "$WORK/spf_s.nii"
+check "sphere optshrink RMS is unchanged" 0 "$GEN" rms "$WORK/spf.nii" 1050.45481 1e-6
+check "sphere sigma map RMS is unchanged" 0 "$GEN" rms "$WORK/spf_s.nii" 330.26322 1e-6
+
+echo "overlapping-patch averaging"
+# Pinned configurations on the 9x9 fixture; threading is tested on mag-wide below.
+# Neither proves the tile width safe -- see AGENTS.md on why tsan-test does not.
+check "gaussian, sphere, stride 2" 0 "$BIN" "$M" "$WORK/ag1.nii" $LEGACY -quiet -aggregator gaussian -shape sphere -stride 2
+check "uniform, stride 2"          0 "$BIN" "$M" "$WORK/agu.nii" $LEGACY -quiet -aggregator uniform -stride 2
+# Every 9x9 fixture is one tile per colour, so runs on it are serial at any
+# -nthreads.  mag-wide is wide enough for several; the worker count is read back.
+"$GEN" mk mag-wide "$WORK/wide.nii" || { echo "fixture mag-wide failed"; exit 1; }
+check "defaults on a wide image, 1 thread" 0 "$BIN" "$WORK/wide.nii" "$WORK/w1.nii" -quiet -nthreads 1
+check "defaults on a wide image, 8 threads" 0 "$BIN" "$WORK/wide.nii" "$WORK/w8.nii" -nthreads 8
+sv_n=$(sed -n 's/.*threads *: *//p' "$WORK/stderr")
+if [ "${sv_n:-1}" -gt 1 ]
+then ok "the averaging run really used $sv_n workers"
+else bad "the averaging run used ${sv_n:-?} worker; the comparison below proves nothing"; fi
+if cmp -s "$WORK/w1.nii" "$WORK/w8.nii"
+then ok "averaging: 1 thread == $sv_n threads, byte for byte"; else bad "averaging: thread count changed the output"; fi
+check "sphere stride-2 RMS is unchanged" 0 "$GEN" rms "$WORK/ag1.nii" 614.241667 1e-6
+check "gaussian stride 2 on big48" 0 "$BIN" "$WORK/f48.nii" "$WORK/ag48.nii" $LEGACY -quiet -aggregator gaussian \
+	-stride 2 -filter optshrink -nthreads 1 -rank "$WORK/ag48_r.nii" -noise "$WORK/ag48_s.nii"
+sv_e3=$(err "$WORK/ag48.nii" "$WORK/f48c.nii")
+if awk "BEGIN{exit !($sv_e3 < $sv_e2)}"
+then ok "averaging beats one patch per voxel against the truth ($sv_e3 < $sv_e2)"
+else bad "averaged error $sv_e3 is not below exclusive optshrink's $sv_e2"; fi
+check "averaged RMS is unchanged"      0 "$GEN" rms "$WORK/ag48.nii" 1049.44369 1e-6
+check "averaged rank RMS is unchanged" 0 "$GEN" rms "$WORK/ag48_r.nii" 8.37028843 1e-6
+check "averaged noise RMS is unchanged" 0 "$GEN" rms "$WORK/ag48_s.nii" 326.568655 1e-6
+check "-stride 2 refused under exclusive" 1 "$BIN" "$M" "$WORK/x.nii" -quiet -aggregator exclusive -stride 2
+# Off-centre weights a float accumulator cannot carry once counted as coverage and
+# zeroed voxels at exit 0: a tiny FWHM, or 20 mm slices at stride 2.  Both must now
+# fall back to the voxel's own patch.
+check "-aggregator_fwhm 0.07"          0 "$BIN" "$M" "$WORK/fw07.nii" -quiet -aggregator_fwhm 0.07
+check "tiny FWHM zeroes no voxel"      0 "$GEN" nozero "$WORK/fw07.nii"
+"$GEN" mk mag-slab "$WORK/slab.nii" || { echo "fixture mag-slab failed"; exit 1; }
+check "20 mm slices, stride 2"         0 "$BIN" "$WORK/slab.nii" "$WORK/slab_o.nii" -quiet -aggregator_fwhm 0.5 -nthreads 1
+check "20 mm slices zero no voxel"     0 "$GEN" nozero "$WORK/slab_o.nii"
+# ...and weight TIMES value: data near 1e-16 on 11 mm slices underflowed float
+# even where the weight alone did not, so no weight cutoff could catch it.
+"$GEN" mk mag-tiny "$WORK/tiny.nii" || { echo "fixture mag-tiny failed"; exit 1; }
+check "data near 1e-16, stride 2"      0 "$BIN" "$WORK/tiny.nii" "$WORK/tiny_o.nii" -quiet -shape cube -vst n -aggregator_fwhm 0.5
+check "tiny data zeroes no voxel"      0 "$GEN" nozero "$WORK/tiny_o.nii"
+# The -noise map is a running mean too; summed, its weight*sigma underflowed even
+# in double at FWHM 0.156 (weights near 1e-304) and wrote 0 for covered voxels.
+check "tiny data, -noise, FWHM 0.156"  0 "$BIN" "$WORK/tiny.nii" "$WORK/tiny_o2.nii" -quiet -shape cube -vst n \
+	-aggregator_fwhm 0.156 -noise "$WORK/tiny_n.nii"
+check "tiny data's noise map has no zero" 0 "$GEN" nozero "$WORK/tiny_n.nii"
+check "20 mm slices RMS is unchanged"  0 "$GEN" rms "$WORK/slab_o.nii" 613.319384 1e-6
+# Each option must do something: pinned, and different from what it replaces.
+check "uniform RMS is unchanged"       0 "$GEN" rms "$WORK/agu.nii" 614.244489 1e-6
+check "-aggregator_fwhm 1"             0 "$BIN" "$M" "$WORK/fw1.nii" -quiet -aggregator_fwhm 1
+check "FWHM 1 RMS is unchanged"        0 "$GEN" rms "$WORK/fw1.nii" 613.309137 1e-6
+check "-aggregator_fwhm needs gaussian"   1 "$BIN" "$M" "$WORK/x.nii" -quiet -aggregator uniform -aggregator_fwhm 3
+check "-stride 3 is refused"              1 "$BIN" "$M" "$WORK/x.nii" -quiet -aggregator gaussian -stride 3
+
+echo "variance stabilisation"
+# Rician noise of sigma 100 on a signal at SNR 0.5-3, against its noise-free
+# truth: the noise floor dominates, so a debiased output must score better.
+"$GEN" mk rician "$WORK/ric.nii" && "$GEN" mk rician-clean "$WORK/ricc.nii" || { echo "fixture rician failed"; exit 1; }
+check "-noise_dof 2 on Rician data"    0 "$BIN" "$WORK/ric.nii" "$WORK/dof2.nii" -quiet -noise_dof 2
+check "-noise_dof 2 RMS is unchanged"  0 "$GEN" rms "$WORK/dof2.nii" 88.060271 1e-6
+# A channel count far above the truth puts every sample under the modelled floor,
+# and the unbiased inverse then returns 0 everywhere: that must not pass silently.
+check_msg "a wrong -noise_dof is warned about" "of the output is zero" \
+	"$BIN" "$WORK/ric.nii" "$WORK/dof4.nii" -noise_dof 4
+check "magnitude, no -vst"   0 "$BIN" "$WORK/ric.nii" "$WORK/v0.nii" $LEGACY -quiet -filter optshrink
+check "-vst y"               0 "$BIN" "$WORK/ric.nii" "$WORK/v1.nii" $LEGACY -quiet -filter optshrink -vst y \
+	-nthreads 1 -noise "$WORK/v1_s.nii"
+check "-vst y, keeping the bias" 0 "$BIN" "$WORK/ric.nii" "$WORK/v2.nii" $LEGACY -quiet -filter optshrink -vst y -preserve_noise_bias
+sv_v0=$(err "$WORK/v0.nii" "$WORK/ricc.nii")
+sv_v1=$(err "$WORK/v1.nii" "$WORK/ricc.nii")
+sv_v2=$(err "$WORK/v2.nii" "$WORK/ricc.nii")
+if awk "BEGIN{exit !($sv_v1 < $sv_v2 && $sv_v2 < $sv_v0)}"
+then ok "debiased < biased VST < no VST against the truth ($sv_v1 < $sv_v2 < $sv_v0)"
+else bad "VST ordering broken: debiased $sv_v1, biased $sv_v2, none $sv_v0"; fi
+# The map must come out near the true 100: raw magnitudes alone read ~91.
+check "VST output RMS is unchanged" 0 "$GEN" rms "$WORK/v1.nii" 182.797846 1e-6
+check "VST sigma RMS is unchanged"  0 "$GEN" rms "$WORK/v1_s.nii" 101.459479 1e-6
+check "-vst y, many threads" 0 "$BIN" "$WORK/ric.nii" "$WORK/v8.nii" $LEGACY -quiet -filter optshrink -vst y -nthreads 8
+if cmp -s "$WORK/v1.nii" "$WORK/v8.nii"
+then ok "vst: 1 thread == 8 threads, byte for byte"; else bad "vst: thread count changed the output"; fi
+check "-vst y with -phase is refused"       1 "$BIN" "$M" "$WORK/x.nii" -quiet -vst y -phase "$WORK/phase-rad.nii"
+check "-noise_dof with -vst n is refused"   1 "$BIN" "$M" "$WORK/x.nii" -quiet -vst n -noise_dof 2
+check "-preserve_noise_bias with -vst n"    1 "$BIN" "$M" "$WORK/x.nii" -quiet -vst n -preserve_noise_bias
+
+echo "defaults"
+# The defaults are sphere + optshrink + gaussian stride 2 + VST.  Everything above
+# pins each piece against the original pipeline; these pin the combination.
+check "defaults on big48"        0 "$BIN" "$WORK/f48.nii" "$WORK/def.nii" -quiet -nthreads 1 \
+	-noise "$WORK/def_s.nii" -rank "$WORK/def_r.nii"
+# big48's noise is uniform and goes negative, so the VST stays off here.
+check "defaults RMS is unchanged"       0 "$GEN" rms "$WORK/def.nii" 1049.27494 1e-6
+check "defaults noise RMS is unchanged" 0 "$GEN" rms "$WORK/def_s.nii" 329.844936 1e-6
+check "defaults rank RMS is unchanged"  0 "$GEN" rms "$WORK/def_r.nii" 8.90914359 1e-6
+check "defaults, no side outputs" 0 "$BIN" "$WORK/f48.nii" "$WORK/def_plain.nii" -quiet -nthreads 8
+if cmp -s "$WORK/def.nii" "$WORK/def_plain.nii"
+then ok "defaults: -noise/-rank and the thread count leave the output alone"
+else bad "defaults: -noise/-rank or the thread count changed the output"; fi
+check "defaults on rician"       0 "$BIN" "$WORK/ric.nii" "$WORK/def_ric.nii" -quiet
+sv_d1=$(err "$WORK/def_ric.nii" "$WORK/ricc.nii")
+if awk "BEGIN{exit !($sv_d1 < $sv_v0)}"
+then ok "defaults beat the old pipeline's optshrink on Rician data ($sv_d1 < $sv_v0)"
+else bad "defaults error $sv_d1 is not below $sv_v0"; fi
+# -help promises a masked run equals an unmasked one inside the mask.  Under
+# averaging that holds only because a centre is kept whenever its patch touches
+# the mask; keeping centres by any other rule breaks it at the mask edge.
+check "masked == unmasked inside the mask" 0 "$GEN" cmpmask "$WORK/masked.nii" "$WORK/unmasked.nii" "$WORK/mask.nii"
+# Signed input cannot be magnitude, so the AUTOMATIC VST stays off, exactly as
+# an explicit -vst n would; that is what keeps a series rotated to real elsewhere
+# (benchmark-large feeds one) from being stabilised as Rician.
+"$GEN" mk mag-signed "$WORK/signed.nii" || { echo "fixture mag-signed failed"; exit 1; }
+check_msg "signed input turns the VST off" "negative values so is not magnitude" \
+	"$BIN" "$WORK/signed.nii" "$WORK/sg_auto.nii"
+if ! "$BIN" -degibbs z 2>&1 | grep -q 'not compiled into this build'; then
+	check_msg "signed input warns before -degibbs truncates it" "input has negative values, and -degibbs" \
+		"$BIN" "$WORK/signed.nii" "$WORK/sg_dg.nii" -degibbs y
+fi
+check "signed input, -vst n" 0 "$BIN" "$WORK/signed.nii" "$WORK/sg_n.nii" -quiet -vst n
+if cmp -s "$WORK/sg_auto.nii" "$WORK/sg_n.nii"
+then ok "signed input: automatic VST == -vst n, byte for byte"; else bad "signed input was stabilised"; fi
+"$BIN" "$M" "$WORK/x.nii" -phase "$WORK/phase-rad.nii" >"$WORK/stdout" 2>"$WORK/stderr"
+if ! grep -q "vst  " "$WORK/stderr"
+then ok "phase input turns the VST off"; else bad "phase input was stabilised as magnitude"; fi
+
+echo "audit regressions"
+# Each of these once failed: an output replaced the b-values it read; a noiseless
+# patch (sigma 0) made optshrink write NaN; a one-slice image made the sphere
+# report a false eigensolver failure.
+echo "0 0 1000 1000 1000 2000 2000 3000" > "$WORK/values.nii"; cp "$WORK/values.nii" "$WORK/values.keep"
+check_collision "output over -bval" "$BIN" "$M" "$WORK/values.nii" -quiet -demean y -bval "$WORK/values.nii"
+if cmp -s "$WORK/values.nii" "$WORK/values.keep"
+then ok "-bval survived the refusal"; else bad "-bval was overwritten"; fi
+check "noiseless, optshrink, exclusive" 0 "$BIN" "$WORK/f48c.nii" "$WORK/nl1.nii" $LEGACY -quiet -filter optshrink
+check "noiseless output is the input"   0 "$GEN" rl2 "$WORK/nl1.nii" "$WORK/f48c.nii" 1e-6
+check "noiseless, defaults"             0 "$BIN" "$WORK/f48c.nii" "$WORK/nl2.nii" -quiet
+check "noiseless default output is the input" 0 "$GEN" rl2 "$WORK/nl2.nii" "$WORK/f48c.nii" 1e-6
+"$GEN" mk mag-thin "$WORK/thin.nii" || { echo "fixture mag-thin failed"; exit 1; }
+check "one slice, sphere, averaging"    0 "$BIN" "$WORK/thin.nii" "$WORK/th1.nii" -quiet
+"$GEN" mk rician-zero "$WORK/ricz.nii" || { echo "fixture rician-zero failed"; exit 1; }
+check "isolated zero samples, defaults" 0 "$BIN" "$WORK/ricz.nii" "$WORK/rz.nii" -quiet -nthreads 1
+# Skipping a lone zero as background (the old rule) moves this to ~172.9.
+check "isolated zeros are stabilised with their voxel" 0 "$GEN" rms "$WORK/rz.nii" 158.896087 1e-6
+# 100 volumes on 243 voxels: the main patch fits, and the larger sigma-estimation
+# patch (k^3 >= 2N) once did not, failing a run the user's settings allowed.
+"$GEN" mk mag-tall "$WORK/tall.nii" || { echo "fixture mag-tall failed"; exit 1; }
+# Two volumes leave too few noise columns for a median sigma: it read ~6x too high
+# and the VST zeroed most of the output.  The run must fall back and say so.
+"$GEN" mk mag-pair "$WORK/pair.nii" || { echo "fixture mag-pair failed"; exit 1; }
+check_msg "two volumes fall back to optthresh" "cannot give a noise level" "$BIN" "$WORK/pair.nii" "$WORK/pair_o.nii"
+check "two volumes zero no voxel" 0 "$GEN" nozero "$WORK/pair_o.nii"
+# ...and a noise map from them would be meaningless, under any filter.
+check "two volumes refuse -noise" 1 "$BIN" "$WORK/pair.nii" "$WORK/x.nii" -quiet $LEGACY -noise "$WORK/pair_n.nii"
+check "100 volumes on a 9x9x3 image" 0 "$BIN" "$WORK/tall.nii" "$WORK/tall_o.nii" -quiet
+check "one slice, sphere, exclusive"    0 "$BIN" "$WORK/thin.nii" "$WORK/th2.nii" -quiet -aggregator exclusive -extent 5
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

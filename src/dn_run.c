@@ -41,13 +41,14 @@
 // mirror every field in dn_work and dn_eig -- a transcription of another
 // module's internals would just drift silently as those change.  The n*n and
 // n*m blocks are what actually grow.
-static size_t worker_bytes(const dn_geom *g) {
+size_t dn_worker_bytes(const dn_geom *g, int full) {
 	const size_t n = (size_t)g->nvol, m = (size_t)g->m;
 	// sizeof(dn_pt_t), not sizeof(float): the patch buffer is double under
 	// Accelerate and float otherwise, so a hardcoded float under-prices every
 	// worker on the macOS default by n*m*4 bytes and lets the cap admit more of
 	// them than the budget allows.
-	return n * m * sizeof(dn_pt_t) + 4 * n * n * sizeof(double);
+	// full: dn_work_full's n*m double block, which only averaging workers hold.
+	return n * m * (sizeof(dn_pt_t) + (full ? sizeof(double) : 0)) + 4 * n * n * sizeof(double);
 }
 
 typedef struct {
@@ -112,7 +113,8 @@ static void *worker(void *arg) {
 		pool->next = hi;
 		pthread_mutex_unlock(&pool->lock);
 
-		for (size_t v = lo; v < hi; v++) {
+		for (size_t k = lo; k < hi; k++) {
+			const size_t v = r->list ? r->list[k] : k;
 			if (r->mask && !r->mask[v]) continue;
 
 			// NIfTI within-volume order: x fastest, then y, then z.
@@ -122,12 +124,13 @@ static void *worker(void *arg) {
 
 			float sigma = 0.0f;
 			uint16_t rank = 0;
-			if (dn_denoise_voxel(g, w, r->img, ix, iy, iz, tmp, &sigma, &rank) != 0) {
+			if (dn_denoise_voxel(g, w, r->img, ix, iy, iz, r->out ? tmp : NULL, &sigma, &rank) != 0) {
 				local_eig_fail++;
 				continue;   // leave this voxel zero rather than write a bad basis
 			}
-			for (int j = 0; j < g->nvol; j++)
-				r->out[v + (size_t)j * g->nvox3d] = tmp[j];
+			if (r->out)
+				for (int j = 0; j < g->nvol; j++)
+					r->out[v + (size_t)j * g->nvox3d] = tmp[j];
 			if (r->noise) r->noise[v] = sigma;
 			if (r->rank) r->rank[v] = rank;
 		}
@@ -157,27 +160,49 @@ int dn_effective_threads(const dn_geom *g, size_t n_work, int requested) {
 	// More workers than cores never helps a CPU-bound kernel, and more workers
 	// than chunks is pure overhead -- the extras allocate a full scratch arena,
 	// find the queue empty and exit.
+	const size_t chunks = (total + DN_CHUNK - 1) / DN_CHUNK;
+	return dn_cap_threads(requested, chunks, dn_worker_bytes(g, 0));
+}
+
+int dn_cap_threads(int requested, size_t units, size_t per) {
 	const int hw = dn_default_threads();
 	if (requested > hw) requested = hw;
-	const size_t chunks = (total + DN_CHUNK - 1) / DN_CHUNK;
-	if (chunks > 0 && (size_t)requested > chunks) requested = (int)chunks;
-	const size_t per = worker_bytes(g);
+	if (units > 0 && (size_t)requested > units) requested = (int)units;
 	const size_t budget = (size_t)1 << 30;   // 1 GiB of scratch, in total
-	if (per > 0 && (size_t)requested * per > budget) {
-		int cap = (int)(budget / per);
-		requested = (cap < 1) ? 1 : cap;
+	if (per > 0 && (size_t)requested * per > budget) requested = (int)(budget / per);
+	return requested < 1 ? 1 : requested;
+}
+
+int dn_pool_report(int failed, unsigned long eig_fail, unsigned long fallbacks) {
+	if (failed) {
+		dn_err("a worker could not allocate its scratch space\n");
+		return 1;
 	}
-	return requested;
+	if (eig_fail) {
+		dn_err("the eigensolver failed to converge for %lu patch%s.\n",
+		       eig_fail, eig_fail == 1ul ? "" : "es");
+		dn_err("  Nothing was written from an unconverged basis. This should not\n");
+		dn_err("  happen; please report it.\n");
+		return 1;
+	}
+	if (fallbacks) {
+		// Not an error: the fallback IS the trusted full solve, so the values are
+		// right. Reported because a non-zero count means inverse iteration is
+		// struggling on this data, which is worth knowing before it gets worse.
+		dn_err("note: inverse iteration fell back to the full solve for %lu patch%s\n",
+		       fallbacks, fallbacks == 1ul ? "" : "es");
+	}
+	return 0;
 }
 
 int dn_run_execute(const dn_run *r) {
-	if (!r || !r->g || !r->img || !r->out) return 1;
+	if (!r || !r->g || !r->img) return 1;
 	int nthreads = dn_effective_threads(r->g, r->n_work, r->nthreads);
 
 	dn_pool pool;
 	memset(&pool, 0, sizeof(pool));
 	pool.r = r;
-	pool.total = r->g->nvox3d;
+	pool.total = r->list ? r->n_work : r->g->nvox3d;
 	pool.chunk = DN_CHUNK;
 
 	if (pthread_mutex_init(&pool.lock, NULL) != 0) {
@@ -188,24 +213,5 @@ int dn_run_execute(const dn_run *r) {
 	dn_thread_run(worker, &pool, nthreads);
 
 	pthread_mutex_destroy(&pool.lock);
-
-	if (pool.failed) {
-		dn_err("a worker could not allocate its scratch space\n");
-		return 1;
-	}
-	if (pool.eig_fail) {
-		dn_err("the eigensolver failed to converge for %lu patch%s.\n",
-		       pool.eig_fail, pool.eig_fail == 1ul ? "" : "es");
-		dn_err("  Those voxels were left at zero rather than written from an\n");
-		dn_err("  unconverged basis. This should not happen; please report it.\n");
-		return 1;
-	}
-	if (pool.fallbacks) {
-		// Not an error: the fallback IS the trusted full solve, so the values are
-		// right. Reported because a non-zero count means inverse iteration is
-		// struggling on this data, which is worth knowing before it gets worse.
-		dn_err("note: inverse iteration fell back to the full solve for %lu patch%s\n",
-		       pool.fallbacks, pool.fallbacks == 1ul ? "" : "es");
-	}
-	return 0;
+	return dn_pool_report(pool.failed, pool.eig_fail, pool.fallbacks);
 }

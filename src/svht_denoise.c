@@ -1,13 +1,12 @@
-// DWI denoising by optimal singular value hard thresholding.
-//
-// Implements the threshold of
-//   M. Gavish and D. L. Donoho, "The Optimal Hard Threshold for Singular Values
-//   is 4/sqrt(3)", IEEE Trans. Inf. Theory 60(8):5040-5053, 2014,
-// applied patch-wise to a 4D diffusion series.  This is NOT Marchenko-Pastur PCA
-// and is not an emulation of MRtrix3 dwidenoise; it is a different estimator
-// that happens to share the patch geometry.
+// DWI denoising by local PCA with the singular value rules of Gavish & Donoho:
+// the optimal hard threshold (IEEE Trans. Inf. Theory 60(8):5040-5053, 2014) and
+// the Frobenius-optimal shrinkage (63(4):2137-2152, 2017, the default), applied
+// patch-wise to a 4D diffusion series.  This is NOT Marchenko-Pastur PCA and is
+// not an emulation of MRtrix3 dwidenoise; the noise level comes from their median
+// estimator, not a Marchenko-Pastur fit.
 
 #include <limits.h>
+#include <math.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -16,10 +15,13 @@
 #include <unistd.h>    // readlink, unlink
 
 #include "dn.h"
+#include "dn_bval.h"
 #include "dn_nii.h"
 #include "dn_patch.h"
 #include "dn_phase.h"
 #include "dn_run.h"
+#include "dn_sigma.h"
+#include "dn_vst.h"
 #ifdef DN_DEGIBBS
 #include "mrdegibbs/dg.h"
 
@@ -31,13 +33,20 @@ static const char *pf_note(double pf) {
 }
 #endif
 
+// Noise-map estimates under -vst: the first from raw magnitudes, each later one
+// corrected in the stabilised domain.  Two, measured on Rician synthetic truth
+// (benchmark/): RMSE at sigma 30 / 60 was 13.77 / 30.24 with one, 13.49 / 25.20
+// with two, 13.75 / 25.30 with three, and worse beyond -- the correction does not
+// converge on the true sigma but overshoots it (64 against 60 after six).
+#define DN_VST_ROUNDS 2
+
 #define DN_VERSION "0.1.20260928"
 
 // -degibbs: no, yes (after denoising), or only (instead of denoising).
 enum { DN_DG_NO = 0, DN_DG_YES, DN_DG_ONLY };
 
 static void usage(void) {
-	printf("svht_denoise %s -- DWI denoising by optimal singular value hard thresholding\n", DN_VERSION);
+	printf("svht_denoise %s -- DWI denoising by local PCA with optimal singular value shrinkage\n", DN_VERSION);
 	printf("\n");
 	printf("USAGE\n");
 	printf("  svht_denoise <input> <output> [options]\n");
@@ -85,7 +94,50 @@ static void usage(void) {
 	printf("                    outside the mask are written as zero.\n");
 	printf("  -noise <image>    write the estimated noise level (float32)\n");
 	printf("  -rank <image>     write the number of retained components (uint16)\n");
-	printf("  -extent <k>       patch side length, odd, k^3 > number of volumes.\n");
+	printf("  -bval <file>      FSL b-values, one per volume.  Default: the input's name\n");
+	printf("                    with .nii/.nii.gz replaced by .bval.  Needs -demean y.\n");
+	printf("  -demean <y/n>     remove each voxel's mean over each b-value shell before\n");
+	printf("                    PCA and restore it after, which lowers the signal rank.\n");
+	printf("                    Default n: measured, it does not help.  Shells are\n");
+	printf("                    clustered as MRtrix3 does (b <= 10 is b=0; neighbours\n");
+	printf("                    less than 80 s/mm^2 apart share a shell); a shell of one\n");
+	printf("                    volume is not demeaned.\n");
+	printf("  -filter <f>       how components are kept: optshrink (default), the\n");
+	printf("                    Frobenius-optimal shrinkage of Gavish & Donoho 2017;\n");
+	printf("                    optthresh, their 2014 unknown-noise hard threshold; or\n");
+	printf("                    truncate, a hard cut at the noise bulk edge.  optshrink\n");
+	printf("                    and truncate read sigma from a noise map estimated\n");
+	printf("                    first, from larger patches on every %dth voxel.\n", DN_SIGMA_STRIDE);
+	printf("  -shape <s>        patch shape: sphere (default) or cube.  The sphere is\n");
+	printf("                    measured in mm, so it stays round on anisotropic voxels,\n");
+	printf("                    and holds the fewest whole distance shells with at\n");
+	printf("                    least k^3 voxels (k from -extent).  At the image edge it\n");
+	printf("                    is the same number of voxels nearest the one denoised.\n");
+	printf("  -aggregator <a>   how patches make the output: gaussian (default), every\n");
+	printf("                    patch adds its estimate to every voxel it covers,\n");
+	printf("                    weighted by distance from its centre (Manjon et al.\n");
+	printf("                    2013); uniform, the same unweighted; or exclusive, each\n");
+	printf("                    voxel from the one patch centred on it.\n");
+	printf("  -aggregator_fwhm <f>  Gaussian width, in units of the patch-centre spacing\n");
+	printf("                    (default 2).  Needs -aggregator gaussian.\n");
+	printf("  -stride <s>       centre a patch on every s-th voxel per axis, 1 or 2,\n");
+	printf("                    which runs ~1/8 as many.  Default 2, or 1 under\n");
+	printf("                    -aggregator exclusive, which needs a patch per voxel.\n");
+	printf("  -vst <y/n>        variance-stabilise MAGNITUDE data before denoising: map\n");
+	printf("                    its Rician / non-central chi noise to unit-variance\n");
+	printf("                    Gaussian (Foi 2011), and map back after.  Default y,\n");
+	printf("                    or n with -phase, whose rotated data are already\n");
+	printf("                    Gaussian.  By default the way back is the exact-unbiased\n");
+	printf("                    inverse, which also removes the noise-floor bias.  Also\n");
+	printf("                    n by default for input with any negative value, which\n");
+	printf("                    cannot be a magnitude image.\n");
+	printf("  -noise_dof <L>    receive channels behind each magnitude (sum of squares),\n");
+	printf("                    so the noise is non-central chi with 2L degrees of\n");
+	printf("                    freedom.  Default 1, i.e. Rician.  Needs -vst y.\n");
+	printf("  -preserve_noise_bias  map back algebraically instead, keeping the noise-floor\n");
+	printf("                    bias of an ordinary magnitude image.  Needs -vst y.\n");
+	printf("  -extent <k>       patch size: cube side length, odd, k^3 > number of\n");
+	printf("                    volumes; a sphere holds at least k^3 voxels.\n");
 	printf("                    Default: the smallest odd k that satisfies this.\n");
 #ifdef DN_DEGIBBS
 	printf("  -degibbs <y/n/o>  remove Gibbs ringing by local subvoxel shifts: yes, no\n");
@@ -129,9 +181,11 @@ static void usage(void) {
 	printf("  -nthreads is a request: it is capped by the core count, by the amount of\n");
 	printf("  work available, and by a scratch-memory budget.  The summary reports the\n");
 	printf("  number that will really run.\n");
-	printf("  The threshold is the unknown-noise-level form, tau = omega(beta) * median\n");
-	printf("  singular value of the patch, so no noise level need be supplied.\n");
-	printf("  .bval/.bvec are never read: this algorithm does not use gradient directions.\n");
+	printf("  No noise level need be supplied: it is estimated from the data.\n");
+	printf("  '-filter optthresh -aggregator exclusive -shape cube -vst n' reproduces\n");
+	printf("  the original pipeline exactly.\n");
+	printf("  .bval is read only to group volumes into shells for -demean; gradient\n");
+	printf("  directions (.bvec) are never used.\n");
 	printf("  Non-finite input is rejected rather than propagated, because any input\n");
 	printf("  voxel can enter a patch.\n");
 }
@@ -257,7 +311,7 @@ static int same_file(const char *a, const char *b) {
 typedef struct {
 	const char *label;    // how this path is named in messages
 	const char *prefix;   // what the user typed, or NULL if unused
-	int is_input;         // read from, therefore must survive the run
+	int is_input;         // read from, so must survive the run; 2: a raw file, not NIfTI
 	char *hdr, *img;      // resolved; owned by this struct
 } dn_path;
 
@@ -283,7 +337,10 @@ static int check_path_collisions(dn_path *p, int n, int nifti_type) {
 		// fail the run.  (Resolving it unconditionally is what briefly broke
 		// `svht_denoise - out.nii < in.nii`.)
 		if (p[i].is_input && p[i].prefix[0] == '-' && p[i].prefix[1] == '\0') continue;
-		const int bad = p[i].is_input
+		// A raw file (the .bval) is opened exactly as named: both "halves" are it.
+		const int bad = p[i].is_input == 2
+		              ? !(p[i].hdr = strdup(p[i].prefix)) || !(p[i].img = strdup(p[i].prefix))
+		              : p[i].is_input
 		              ? dn_resolve_input_names(p[i].prefix, &p[i].hdr, &p[i].img)
 		              : dn_resolve_names(p[i].prefix, nifti_type, &p[i].hdr, &p[i].img);
 		if (bad) {
@@ -341,10 +398,75 @@ static int parse_int(const char *s, int *out) {
 	return 0;
 }
 
+// One stabilising pass over the live voxels: magnitude / sigma -> f.  `prev` is
+// the sigma each voxel is currently in units of, ignored when `first`; later
+// passes recover the raw magnitude through f's exact algebraic inverse instead of
+// keeping a second copy of the series.  `prev` is updated to `sigma`.
+static void vst_stabilise(const dn_vst *vt, float *data, size_t nvox3d, int nvol, const uint8_t *live,
+                          const float *sigma, float *prev, int first) {
+	for (size_t v = 0; v < nvox3d; v++) {
+		if (!live[v]) continue;
+		const double s = sigma[v], p = first ? 0.0 : prev[v];
+		for (int j = 0; j < nvol; j++) {
+			float *x = data + v + (size_t)j * nvox3d;
+			const double raw = first ? *x : p * dn_vst_inverse(vt, *x, 0);
+			*x = (float)dn_vst_forward(vt, raw / s);
+		}
+		prev[v] = (float)s;
+	}
+}
+
+// Map a denoised, stabilised series back to magnitude: every sample of a live,
+// in-mask voxel -- a denoised 0 is a value too, and the algebraic inverse maps it
+// onto the noise floor.  The denoiser saw sigma = 1, so the noise map it wrote is
+// replaced by the data's own.
+static void vst_restore(const dn_vst *vt, float *out, float *noise, size_t nvox3d, int nvol,
+                        const uint8_t *live, const uint8_t *mask, const float *sigma, int unbiased) {
+	for (size_t v = 0; v < nvox3d; v++) {
+		const double s = sigma[v];
+		if (live[v] && (!mask || mask[v]))
+			for (int j = 0; j < nvol; j++) {
+				float *o = out + v + (size_t)j * nvox3d;
+				*o = (float)(s * dn_vst_inverse(vt, *o, unbiased));
+			}
+		if (noise && noise[v] != 0.0f) noise[v] = (float)s;
+	}
+}
+
+// Index of `v` in the NULL-terminated `names`, into *out; the index is the option's
+// enum value.  Returns non-zero, reported, for anything else.
+static int parse_choice(const char *flag, const char *v, const char *const *names, int *out) {
+	for (int i = 0; names[i]; i++)
+		if (!strcmp(v, names[i])) { *out = i; return 0; }
+	dn_err("%s must be one of:", flag);
+	for (int i = 0; names[i]; i++) fprintf(stderr, " %s", names[i]);
+	fprintf(stderr, " (got '%s')\n", v);
+	return 1;
+}
+
 int main(int argc, char *argv[]) {
 	const char *fin = NULL, *fout = NULL;
 	const char *fmask = NULL, *fnoise = NULL, *frank = NULL;
-	const char *fphase = NULL, *freal = NULL;
+	const char *fphase = NULL, *freal = NULL, *fbval = NULL;
+	// Off by default: measured neutral under the hard threshold (RMSE -0.4% at
+	// sigma 10, +1.3% at sigma 30, synthetic truth on benchmark/).
+	int demean = 0;
+	// Defaults chosen by measurement against a synthetic truth (AGENTS.md dead ends):
+	// each beat the original exclusive / optthresh / cube pipeline, which
+	// `-filter optthresh -aggregator exclusive -shape cube -vst n` still reproduces
+	// byte for byte.
+	int filter = DN_FILTER_OPTSHRINK;
+	int shape = DN_SHAPE_SPHERE;
+	int aggregator = DN_AGG_GAUSSIAN, stride = 0;   // 0: auto
+	double fwhm = 2.0;
+	int fwhm_given = 0;
+	int vst = -1, ncoil = 1, ncoil_given = 0, keep_bias = 0;   // -1: auto
+	// Options that only the denoiser reads, counted so -degibbs o can refuse them.
+	int denoise_opts = 0;
+	static const char *const yes_no[] = {"n", "y", NULL};
+	static const char *const filters[] = {"optthresh", "optshrink", "truncate", NULL};   // DN_FILTER_*
+	static const char *const shapes[] = {"cube", "sphere", NULL};                        // DN_SHAPE_*
+	static const char *const aggregators[] = {"exclusive", "gaussian", "uniform", NULL}; // DN_AGG_*
 	dn_phase_units punits = DN_PHASE_AUTO;
 	// Presence, not value: "-phaseunits auto" leaves punits at its default, so
 	// testing the enum would let that one spelling slip past the check below
@@ -376,6 +498,7 @@ int main(int argc, char *argv[]) {
 			return EXIT_SUCCESS;
 		}
 		if (!strcmp(a, "-quiet")) { quiet = 1; continue; }
+		if (!strcmp(a, "-preserve_noise_bias")) { keep_bias = 1; denoise_opts++; continue; }
 
 		if (a[0] == '-' && a[1] != '\0') {
 			// Every remaining flag takes exactly one argument.
@@ -389,6 +512,43 @@ int main(int argc, char *argv[]) {
 			else if (!strcmp(a, "-rank")) frank = v;
 			else if (!strcmp(a, "-phase")) fphase = v;
 			else if (!strcmp(a, "-real")) freal = v;
+			else if (!strcmp(a, "-bval")) { fbval = v; denoise_opts++; }
+			else if (!strcmp(a, "-vst") || !strcmp(a, "-demean") || !strcmp(a, "-filter") ||
+			         !strcmp(a, "-shape") || !strcmp(a, "-aggregator")) {
+				denoise_opts++;
+				int bad;
+				if (!strcmp(a, "-vst")) bad = parse_choice(a, v, yes_no, &vst);
+				else if (!strcmp(a, "-demean")) bad = parse_choice(a, v, yes_no, &demean);
+				else if (!strcmp(a, "-filter")) bad = parse_choice(a, v, filters, &filter);
+				else if (!strcmp(a, "-shape")) bad = parse_choice(a, v, shapes, &shape);
+				else bad = parse_choice(a, v, aggregators, &aggregator);
+				if (bad) return EXIT_FAILURE;
+			}
+			else if (!strcmp(a, "-noise_dof")) {
+				if (parse_int(v, &ncoil) || ncoil < 1 || ncoil > 64) {
+					dn_err("-noise_dof needs a channel count from 1 to 64 (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				ncoil_given = 1;
+				denoise_opts++;
+			}
+			else if (!strcmp(a, "-aggregator_fwhm")) {
+				char *pend = NULL;
+				fwhm = strtod(v, &pend);
+				if (*pend != '\0' || pend == v || !(fwhm > 0.0) || !isfinite(fwhm)) {
+					dn_err("-aggregator_fwhm needs a positive number (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				fwhm_given = 1;
+				denoise_opts++;
+			}
+			else if (!strcmp(a, "-stride")) {
+				if (parse_int(v, &stride) || stride < 1 || stride > 2) {
+					dn_err("-stride must be 1 or 2 (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				denoise_opts++;
+			}
 			else if (!strcmp(a, "-phaseunits")) {
 				punits_given = 1;
 				if (!strcmp(v, "auto")) punits = DN_PHASE_AUTO;
@@ -486,9 +646,10 @@ int main(int argc, char *argv[]) {
 	// only to change the noise the denoiser sees -- has nothing to act on.
 	// Ignoring them silently would give a run that looked fine and wrote fewer
 	// files than were asked for.
-	if (degibbs == DN_DG_ONLY && (fmask || fnoise || frank || fphase || freal || extent_given)) {
-		dn_err("-degibbs o does no denoising, so -mask, -noise, -rank, -phase, -real\n");
-		dn_err("  and -extent have nothing to act on.\n");
+	if (degibbs == DN_DG_ONLY && (fmask || fnoise || frank || fphase || freal || extent_given ||
+	                              denoise_opts)) {
+		dn_err("-degibbs o does no denoising, so none of the denoiser's options have\n");
+		dn_err("  anything to act on.\n");
 		return EXIT_FAILURE;
 	}
 	// A masked run leaves hard zeros outside the mask, and a hard zero edge is
@@ -515,14 +676,41 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 #endif
+	// Auto: stride 2 under averaging, 1 when only centres are kept.  An automatic
+	// VST is decided once the input is read (see below).
+	if (!stride) stride = aggregator == DN_AGG_EXCLUSIVE ? 1 : 2;
+	if (vst == 1 && fphase) {
+		dn_err("-vst stabilises magnitude noise; -phase data are rotated to real and are\n");
+		dn_err("  already Gaussian.\n");
+		return EXIT_FAILURE;
+	}
+	if (fwhm_given && aggregator != DN_AGG_GAUSSIAN) {
+		dn_err("-aggregator_fwhm sets the Gaussian width, which needs -aggregator gaussian.\n");
+		return EXIT_FAILURE;
+	}
+	if (stride > 1 && aggregator == DN_AGG_EXCLUSIVE) {
+		dn_err("-stride %d leaves voxels with no patch centred on them; it needs\n", stride);
+		dn_err("  -aggregator gaussian or uniform.\n");
+		return EXIT_FAILURE;
+	}
+	if (fbval && !demean) {
+		dn_err("-bval is only used by -demean y.\n");
+		return EXIT_FAILURE;
+	}
 	if (punits_given && !fphase) {
 		dn_err("-phaseunits describes the -phase image, which was not given.\n");
 		return EXIT_FAILURE;
 	}
 	int status = EXIT_FAILURE;
 	dn_image img;
-	uint8_t *mask = NULL;
-	float *out = NULL, *noise = NULL;
+	uint8_t *mask = NULL, *live = NULL;
+	float *out = NULL, *noise = NULL, *means = NULL, *sigma_map = NULL, *unit_map = NULL;
+	dn_vst *vt = NULL;
+	int need_map = 0;
+	int *group = NULL;
+	double *shell_b = NULL;
+	int *shell_n = NULL;
+	char *bval_auto = NULL;
 	uint16_t *rank = NULL;
 
 	// Not require4d in "only" mode: mrdegibbs accepts a 3D image, and the
@@ -531,8 +719,21 @@ int main(int argc, char *argv[]) {
 
 	// After the read, not before: resolving an output prefix needs the input's
 	// nifti_type.  Still ahead of every write, and ahead of the denoising itself.
+	// The b-values -demean y will read, explicit or the input's sidecar, so the
+	// collision check below covers them: an output named over them would replace
+	// the text it read at exit 0.
+	if (demean && !fbval) {
+		if (!strcmp(fin, "-")) {
+			dn_err("-demean y on stdin needs -bval: there is no input name to find it by.\n");
+			goto done;
+		}
+		bval_auto = dn_bval_sidecar(fin);
+		if (!bval_auto) goto done;
+		fbval = bval_auto;
+	}
 	dn_path paths[] = {
 		{"input",  fin,    1, NULL, NULL},
+		{"-bval",  fbval,  2, NULL, NULL},
 		{"-mask",  fmask,  1, NULL, NULL},
 		{"-phase", fphase, 1, NULL, NULL},
 		{"output", fout,   0, NULL, NULL},
@@ -572,11 +773,87 @@ int main(int argc, char *argv[]) {
 	}
 #endif
 
+	// A magnitude image is never negative, so a negative voxel means signed data
+	// -- typically a series already rotated to real elsewhere -- whose noise is
+	// Gaussian, and stabilising it as Rician would bias it.  Only the automatic
+	// choice yields to this; an explicit -vst y is obeyed.
+	// -phase also says the input is not magnitude.
+	int vst_off_signed = 0;
+	if (vst < 0) {
+		vst = !fphase;
+		for (size_t i = 0; vst && i < img.nvox3d * (size_t)img.nvol; i++)
+			if (img.data[i] < 0.0f) { vst = 0; vst_off_signed = 1; }
+	}
+	if ((ncoil_given || keep_bias) && !vst) {
+		dn_err("-noise_dof and -preserve_noise_bias describe -vst y, which is %s.\n",
+		       vst_off_signed ? "off because the input has negative values" : "not enabled");
+		goto done;
+	}
+
 	const int extent_was_auto = !extent_given;
 	if (!extent_given) extent = dn_auto_extent(img.nvol);
 
-	dn_geom g;
-	if (dn_geom_init(&g, img.nx, img.ny, img.nz, img.nvol, extent)) goto done;
+	int ngroups = 0;
+	if (demean) {
+		group = (int *)dn_malloc((size_t)img.nvol, sizeof(int));
+		shell_b = (double *)dn_malloc((size_t)img.nvol, sizeof(double));
+		shell_n = (int *)dn_malloc((size_t)img.nvol, sizeof(int));
+		if (!group || !shell_b || !shell_n) goto done;
+		ngroups = dn_bval_groups(fbval, img.nvol, group, shell_b, shell_n);
+		if (ngroups < 0) goto done;
+	}
+	// The noise level is a MEDIAN singular value, which needs a noise bulk: with
+	// two columns left after demeaning, the "median" averages signal and noise and
+	// read 5.8 against a true 1, and the VST then zeroed 80% of the output.  A
+	// noise map from such data is meaningless, so -noise is refused; otherwise the
+	// hard threshold, which uses no sigma, takes over rather than refuse a run the
+	// minimum input (2 volumes) is allowed.
+	need_map = filter != DN_FILTER_OPTTHRESH || vst;
+	if (img.nvol - ngroups < 3) {
+		if (fnoise) {
+			dn_err("-noise needs at least 3 noise columns (volumes minus demeaned shells);\n");
+			dn_err("  this run has %d, from which no noise level can be estimated.\n", img.nvol - ngroups);
+			goto done;
+		}
+		if (need_map) {
+			dn_err("note: %d noise column%s cannot give a noise level, so this run uses\n",
+			       img.nvol - ngroups, img.nvol - ngroups == 1 ? "" : "s");
+			dn_err("  -filter optthresh without -vst.\n");
+			filter = DN_FILTER_OPTTHRESH;
+			vst = 0;
+			need_map = 0;
+		}
+	}
+
+	dn_geom g, g1;
+	// A spacing the header cannot vouch for is taken as isotropic: non-positive,
+	// non-finite, or axes more than 1000x apart, which no acquisition has and which
+	// would size the sphere's neighbour box from a nonsense ratio.
+	double sp[3] = {img.nim->dx, img.nim->dy, img.nim->dz};
+	int sp_ok = 1;
+	for (int a = 0; a < 3; a++)
+		if (!(sp[a] > 0.0) || !isfinite(sp[a])) sp_ok = 0;
+	if (sp_ok && fmax(fmax(sp[0], sp[1]), sp[2]) > 1000.0 * fmin(fmin(sp[0], sp[1]), sp[2])) {
+		dn_err("note: voxel spacing %g x %g x %g is implausible; treating it as isotropic\n",
+		       sp[0], sp[1], sp[2]);
+		sp_ok = 0;
+	}
+	if (!sp_ok) sp[0] = sp[1] = sp[2] = 1.0;
+	if (dn_geom_init(&g, shape, img.nx, img.ny, img.nz, img.nvol, sp[0], sp[1], sp[2], extent, ngroups))
+		goto done;
+	if (need_map) {
+		// A cube must fit the image; a sphere need not.
+		int cap = img.nx < img.ny ? img.nx : img.ny;
+		if (img.nz < cap) cap = img.nz;
+		// A sphere need not fit inside the image, but its voxels must: half the image
+		// leaves room for the whole-shell overshoot.  Never below the main patch.
+		if (shape == DN_SHAPE_SPHERE)
+			for (cap = 3; (double)(cap + 2) * (cap + 2) * (cap + 2) <= 0.5 * (double)img.nvox3d; cap += 2) ;
+		const int k1 = dn_sigma_extent(img.nvol, extent, cap);
+		if (dn_geom_init(&g1, shape, img.nx, img.ny, img.nz, img.nvol, sp[0], sp[1], sp[2], k1, ngroups))
+			goto done;
+	}
+	g.filter = filter;
 
 	size_t n_in_mask = img.nvox3d;
 	if (fmask) {
@@ -588,19 +865,44 @@ int main(int argc, char *argv[]) {
 	// The REQUEST, kept separate from the denoiser's effective count below.
 	// -degibbs has its own cap and none of the denoiser's constraints -- no mask,
 	// no patch arena -- so handing it the throttled number would let a small mask
-	// or the eigensolver's scratch budget starve a stage limited by neither.
-#ifdef DN_DEGIBBS
+	// or the eigensolver's scratch budget starve a stage limited by neither.  The
+	// sigma pass has its own geometry and visits no mask, so the same applies.
 	const int nthreads_req = nthreads;
-#endif
-	// Report what will actually run, not what was asked for.
-	nthreads = dn_effective_threads(&g, n_in_mask, nthreads);
+	// Report what will actually run, not what was asked for.  Averaging visits
+	// patch centres in tiles, not masked voxels, so it sizes its own team.
+	nthreads = aggregator == DN_AGG_EXCLUSIVE ? dn_effective_threads(&g, n_in_mask, nthreads)
+	                                          : dn_agg_threads(&g, stride, nthreads);
 
 	if (!quiet) {
 		dn_err("input        : %s (%dx%dx%d, %d volumes)\n",
 		        fin, img.nx, img.ny, img.nz, img.nvol);
-		dn_err("patch        : %dx%dx%d = %d voxels x %d volumes%s\n",
-		        g.extent, g.extent, g.extent, g.m, g.nvol,
-		        extent_was_auto ? " (auto)" : "");
+		if (shape == DN_SHAPE_SPHERE)
+			dn_err("patch        : sphere, radius %.3g mm = %d voxels x %d volumes\n",
+			        sqrt(g.r2), g.m, g.nvol);
+		else
+			dn_err("patch        : %dx%dx%d = %d voxels x %d volumes%s\n",
+			        g.extent, g.extent, g.extent, g.m, g.nvol,
+			        extent_was_auto ? " (auto)" : "");
+		if (ngroups) {
+			dn_err("demean       : %d shell%s from %s:", ngroups, ngroups == 1 ? "" : "s", fbval);
+			for (int s = 0; s < ngroups; s++)
+				fprintf(stderr, " b=%.0f x%d", shell_b[s], shell_n[s]);
+			fprintf(stderr, "\n");
+		} else if (demean)
+			dn_err("demean       : none (no shell of 2+ volumes in %s)\n", fbval);
+		dn_err("filter       : %s\n", filters[filter]);
+		if (need_map)
+			dn_err("sigma map    : from %d-voxel patches on every %dth voxel\n", g1.m, DN_SIGMA_STRIDE);
+		if (vst_off_signed)
+			dn_err("vst          : off, the input has negative values so is not magnitude\n");
+		if (vst)
+			dn_err("vst          : non-central chi, %d channel%s%s, %s inverse\n", ncoil,
+			        ncoil == 1 ? "" : "s", ncoil == 1 ? " (Rician)" : "",
+			        keep_bias ? "algebraic" : "exact-unbiased");
+		if (aggregator != DN_AGG_EXCLUSIVE)
+			dn_err("aggregator   : %s, patch centred on every %svoxel\n",
+			        aggregators[aggregator],
+			        stride == 1 ? "" : "2nd ");
 		dn_err("beta         : %.9f\n", g.beta);
 		dn_err("omega(beta)  : %.9f\n", g.omega);
 		dn_err("threads      : %d\n", nthreads);
@@ -632,12 +934,80 @@ int main(int argc, char *argv[]) {
 	// background noise zero-mean and degibbs truncates it -- and a scripted
 	// -quiet run is the case that most needs telling.  One dn_err per line: it
 	// prefixes per CALL.
-	if (degibbs == DN_DG_YES && fphase) {
-		dn_err("warning: -phase output is signed, and -degibbs truncates it to zero,\n");
+	// Any signed input, not only -phase: a series rotated to real elsewhere is
+	// truncated just the same, and once did so silently.
+	int signed_input = fphase || vst_off_signed;
+	for (size_t i = 0; degibbs == DN_DG_YES && !signed_input && i < img.nvox3d * (size_t)img.nvol; i++)
+		signed_input = img.data[i] < 0.0f;
+	if (degibbs == DN_DG_YES && signed_input) {
+		dn_err("warning: %s, and -degibbs truncates it to zero,\n",
+		       fphase ? "-phase output is signed" : "the input has negative values");
 		dn_err("  reinstating a positive bias in background voxels.  Use -degibbs n if\n");
 		dn_err("  the denoised series needs to stay signed.\n");
 	}
 #endif
+
+	// After the rotation: the means are of the data the denoiser actually sees.
+	if (ngroups) {
+		means = dn_bval_means(img.data, img.nvox3d, img.nvol, group, ngroups);
+		if (!means) goto done;
+		g.group = g1.group = group;
+		g.mean = g1.mean = means;
+	}
+	if (need_map) {
+		sigma_map = dn_sigma_map(&g1, img.data, nthreads_req);
+		if (!sigma_map) goto done;
+		g.sigma_map = sigma_map;
+	}
+	// Stabilise in place, in units of the local sigma, so the denoiser then sees
+	// unit-variance Gaussian noise everywhere and reads sigma = 1.
+	//
+	// The map above was estimated from RAW magnitudes, whose spread shrinks near
+	// the noise floor, so it reads low there: 47 against a true 60 on benchmark/
+	// at that noise level.  So sigma is re-estimated in the stabilised domain,
+	// where it should come out as 1, and corrected by that factor (dwidenoise2
+	// iterates for the same reason).  Each round recovers the raw value through
+	// f's exact algebraic inverse rather than keeping a second copy of the series.
+	if (vst) {
+		const int filled = dn_sigma_fill(sigma_map, img.nvox3d);
+		if (filled < 0) goto done;
+		if (filled) {
+			// Noiseless input: nothing to stabilise against, and nothing to denoise.
+			dn_err("note: no noise level could be estimated, so the data are not stabilised\n");
+			vst = 0;
+		}
+	}
+	if (vst) {
+		vt = dn_vst_create(ncoil);
+		unit_map = (float *)dn_malloc(img.nvox3d, sizeof(float));
+		live = (uint8_t *)dn_calloc(img.nvox3d, 1);
+		if (!vt || !unit_map || !live) goto done;
+		// A voxel zero in EVERY volume is masked-out background, not magnitude
+		// samples, and stays zero so all-zero patches still short-circuit.  A lone
+		// zero sample in a live voxel is real data (quantised magnitude can hit 0)
+		// and is transformed with the rest of its vector.
+		for (int j = 0; j < img.nvol; j++)
+			for (size_t v = 0; v < img.nvox3d; v++)
+				if (img.data[v + (size_t)j * img.nvox3d] != 0.0f) live[v] = 1;
+		for (int it = 0; it < DN_VST_ROUNDS; it++) {
+			// unit_map holds the sigma each voxel is in units of, until the end.
+			vst_stabilise(vt, img.data, img.nvox3d, img.nvol, live, sigma_map, unit_map, it == 0);
+			if (ngroups) {
+				free(means);
+				means = dn_bval_means(img.data, img.nvox3d, img.nvol, group, ngroups);
+				if (!means) goto done;
+				g.mean = g1.mean = means;
+			}
+			if (it == DN_VST_ROUNDS - 1) break;
+			float *ratio = dn_sigma_map(&g1, img.data, nthreads_req);
+			if (!ratio) goto done;
+			for (size_t v = 0; v < img.nvox3d; v++)
+				if (ratio[v] > 0.0f) sigma_map[v] *= ratio[v];
+			free(ratio);
+		}
+		for (size_t v = 0; v < img.nvox3d; v++) unit_map[v] = 1.0f;
+		g.sigma_map = unit_map;
+	}
 
 	// Zero-initialised: voxels outside the mask are never visited and must read
 	// as zero in every output.
@@ -662,8 +1032,32 @@ int main(int argc, char *argv[]) {
 	r.rank = rank;
 	r.n_work = n_in_mask;
 	r.nthreads = nthreads;
+	r.aggregator = aggregator;
+	r.fwhm = fwhm;
+	r.stride = stride;
 
-	if (dn_run_execute(&r)) goto done;
+	if (aggregator == DN_AGG_EXCLUSIVE ? dn_run_execute(&r) : dn_agg_execute(&r)) goto done;
+
+	if (vst) {
+		vst_restore(vt, out, noise, img.nvox3d, img.nvol, live, mask, sigma_map, !keep_bias);
+		// The unbiased inverse returns 0 for anything at or below the noise floor,
+		// which is right for the model given -- and a mis-stated -noise_dof puts all
+		// of the data there (measured: -noise_dof 4 on Rician data zeroed every
+		// sample, at exit 0).  Say so rather than hand back an empty image.
+		size_t nlive = 0, nzero = 0;
+		for (size_t v = 0; v < img.nvox3d; v++) {
+			if (!live[v] || (mask && !mask[v])) continue;
+			for (int j = 0; j < img.nvol; j++) {
+				nlive++;
+				nzero += out[v + (size_t)j * img.nvox3d] == 0.0f;
+			}
+		}
+		if (nzero * 2 > nlive) {
+			dn_err("warning: %.0f%% of the output is zero, i.e. at or below the noise floor.\n",
+			       100.0 * nzero / nlive);
+			dn_err("  Check -noise_dof (%d), or use -preserve_noise_bias or -vst n.\n", ncoil);
+		}
+	}
 
 #ifdef DN_DEGIBBS
 	// After the denoiser, never before: degibbsing first would alter the noise
@@ -687,8 +1081,17 @@ int main(int argc, char *argv[]) {
 done:
 	free(out);
 	free(noise);
+	free(means);
+	free(sigma_map);
+	free(unit_map);
+	dn_vst_free(vt);
+	free(group);
+	free(shell_b);
+	free(shell_n);
+	free(bval_auto);
 	free(rank);
 	free(mask);
+	free(live);
 	dn_image_free(&img);
 	return status;
 }

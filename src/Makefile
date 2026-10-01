@@ -234,7 +234,7 @@ NIFTI_CFLAGS = $(REQ_CFLAGS) $(OPT) -w $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
 # become the default goal; say what the default is instead of relying on order.
 .DEFAULT_GOAL := all
 
-OBJS  = dn.o dn_coef.o dn_lambda_star.o dn_eig.o dn_patch.o dn_nii.o dn_phase.o dn_run.o \
+OBJS  = dn.o dn_bval.o dn_coef.o dn_lambda_star.o dn_eig.o dn_patch.o dn_nii.o dn_phase.o dn_run.o dn_sigma.o dn_agg.o dn_vst.o \
         $(DEGIBBS_OBJS)
 MAIN  = svht_denoise.o
 NIFTI = nifti_io.o

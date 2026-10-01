@@ -8,14 +8,20 @@
 //   dn_testgen mk  <kind> <out.nii>            write a fixture ("kind@" -> .hdr/.img pair)
 //   dn_testgen cmp <a.nii> <b.nii> <tol>       exit 0 if max|a-b| <= tol
 //   dn_testgen rl2 <a.nii> <b.nii> <tol>       exit 0 if rms(a-b)/rms(b) <= tol
+//   dn_testgen cmpmask <a> <b> <mask>          exit 0 if a == b inside the mask, a == 0 outside
 //   dn_testgen rms <file.nii> <want> <reltol>  exit 0 if the RMS still matches
 //   dn_testgen neg <file.nii>                  exit 0 if any value is negative
 //
-// Fixtures are 9x9x3 x 8 volumes, deterministic, with five exceptions: "mask" is
-// a single volume, "big48" is 9x9x5 x 48, "mask-wrongdim" is 7x9x3 x 1,
-// "mag-even" is 9x10x3 -- the only shape -pF 0.75 runs on at all -- and
-// "mag-shorty" is 9x6x3, which is even too but whose -pF interleaves are too
-// short at either factor.
+// Fixtures are 9x9x3 x 8 volumes and deterministic, except:
+//   mask            a single volume          mask-wrongdim  7x9x3 x 1
+//   mag-pair        9x9x3 x 2                mag-tall       9x9x3 x 100
+//   mag-wide        40x40x6                  mag-thin       40x40x1 x 30
+//   mag-aniso       2.5 mm slices            mag-slab       20 mm slices
+//   mag-tiny        ~1e-16 values on 11 mm slices
+//   big48(-clean)   9x9x5 x 48, low rank, and its noiseless truth
+//   rician(-clean, -zero)  9x9x5 x 48 low-SNR magnitude, truth, isolated zeros
+//   mag-even        9x10x3 -- the only shape -pF 0.75 runs on at all
+//   mag-shorty      9x6x3, even too, but its -pF interleaves are too short
 //
 // Every phase kind bar phase-siemens encodes the SAME underlying phase, so any
 // two of them must denoise to the same answer.
@@ -28,6 +34,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI   // XSI, not C99
+#define M_PI 3.14159265358979323846
+#endif
 
 #define NX 9
 #define NY 9
@@ -79,6 +89,9 @@ static double phase_rad(int v) {
 // expand it to a .nii; a fixture set of single .nii files cannot reach it.
 static int write_pair(const char *prefix, const float *data, int nt, double vox);
 
+// Slice thickness relative to the in-plane spacing; only "mag-aniso" changes it.
+static double vox_z_scale = 1.0;
+
 static int write_nii_dim(const char *path, const float *data, int nx, int ny, int nz, int nt, double vox) {
 	nhdr1 h;
 	if (sizeof h != 348) { fprintf(stderr, "header is %zu bytes, not 348\n", sizeof h); return 1; }
@@ -91,13 +104,14 @@ static int write_nii_dim(const char *path, const float *data, int nx, int ny, in
 	h.datatype = 16;   // DT_FLOAT32
 	h.bitpix = 32;
 	h.pixdim[0] = 1.0f;
-	h.pixdim[1] = h.pixdim[2] = h.pixdim[3] = (float)vox;
+	h.pixdim[1] = h.pixdim[2] = (float)vox;
+	h.pixdim[3] = (float)(vox * vox_z_scale);
 	h.pixdim[4] = 1.0f;
 	h.vox_offset = 352.0f;
 	h.scl_slope = 0.0f;         // "no scaling" per the standard
 	h.xyzt_units = 2;           // NIFTI_UNITS_MM
 	h.sform_code = 1;
-	h.srow_x[0] = (float)vox; h.srow_y[1] = (float)vox; h.srow_z[2] = (float)vox;
+	h.srow_x[0] = (float)vox; h.srow_y[1] = (float)vox; h.srow_z[2] = (float)(vox * vox_z_scale);
 	memcpy(h.magic, "n+1", 4);
 
 	FILE *f = fopen(path, "wb");
@@ -215,6 +229,41 @@ int main(int argc, char **argv) {
 	// Relative L2, which is what an optimisation is judged on: a solver change
 	// moves every voxel by a little, and `cmp`'s maximum absolute difference
 	// cannot tell that from one voxel moving a lot.  Both are printed.
+	if (argc == 3 && !strcmp(argv[1], "nozero")) {
+		// No voxel that is zero in EVERY volume: catches an output silently zeroed.
+		nhdr1 h;
+		FILE *f = fopen(argv[2], "rb");
+		if (!f || fread(&h, sizeof h, 1, f) != 1) { if (f) fclose(f); return 2; }
+		fclose(f);
+		const int nt = h.dim[0] >= 4 && h.dim[4] > 0 ? h.dim[4] : 1;
+		int n = 0;
+		float *a = read_nii(argv[2], &n);
+		if (!a || n % nt) { free(a); return 2; }
+		const int n3 = n / nt;
+		int bad = 0;
+		for (int v = 0; v < n3; v++) {
+			int any = 0;
+			for (int t = 0; t < nt; t++) any |= a[(size_t)t * n3 + v] != 0.0f;
+			bad += !any;
+		}
+		free(a);
+		printf("%d all-zero voxels\n", bad);
+		return bad ? 1 : 0;
+	}
+	if (argc == 5 && !strcmp(argv[1], "cmpmask")) {
+		// a and b equal wherever the 3D mask is > 0, and a zero everywhere else.
+		int na = 0, nb = 0, nm = 0;
+		float *a = read_nii(argv[2], &na), *b = read_nii(argv[3], &nb), *mk = read_nii(argv[4], &nm);
+		if (!a || !b || !mk || na != nb || nm <= 0 || na % nm) { free(a); free(b); free(mk); return 2; }
+		int bad = 0;
+		for (int i = 0; i < na; i++) {
+			const int in = mk[i % nm] > 0.0f;
+			if (in ? a[i] != b[i] : a[i] != 0.0f) bad++;
+		}
+		free(a); free(b); free(mk);
+		printf("%d voxel-volumes differ\n", bad);
+		return bad ? 1 : 0;
+	}
 	if (argc == 5 && !strcmp(argv[1], "rl2")) {
 		int na = 0, nb = 0;
 		float *a = read_nii(argv[2], &na), *b = read_nii(argv[3], &nb);
@@ -274,6 +323,8 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "usage: dn_testgen mk   <kind> <out.nii>\n"
 		                "       dn_testgen cmp  <a.nii> <b.nii> <tol>\n"
 		                "       dn_testgen rl2  <a.nii> <b.nii> <reltol>\n"
+		                "       dn_testgen cmpmask <a.nii> <b.nii> <mask.nii>\n"
+		                "       dn_testgen nozero <file.nii>\n"
 		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n"
 		                "       dn_testgen neg  <file.nii>\n");
 		return 2;
@@ -288,14 +339,16 @@ int main(int argc, char **argv) {
 	if (as_pair) kbuf[--klen] = '\0';
 	const char *kind = kbuf;
 
-	// Three kinds build their own shape and return before the shared writer at
+	// Several kinds build their own shape and return before the shared writer at
 	// the bottom, so the "@" pair form cannot apply to them.  Rejected HERE, once,
 	// before anything is allocated or written: the per-branch checks this replaced
 	// ran after the file had already been written, so a refused run exited 2 and
 	// still left an unrequested .nii behind -- and mask-wrongdim had no check at
 	// all, so it exited 0 having quietly written the single-file form instead.
-	if (as_pair && (!strcmp(kind, "big48") || !strcmp(kind, "phase-nan") ||
-	                !strcmp(kind, "mask-wrongdim"))) {
+	if (as_pair && (!strcmp(kind, "big48") || !strcmp(kind, "big48-clean") ||
+	                !strcmp(kind, "rician") || !strcmp(kind, "rician-clean") || !strcmp(kind, "rician-zero") ||
+	                !strcmp(kind, "mag-tall") || !strcmp(kind, "mag-thin") || !strcmp(kind, "mag-wide") ||
+	                !strcmp(kind, "phase-nan") || !strcmp(kind, "mask-wrongdim"))) {
 		fprintf(stderr, "%s does not support the '@' pair form\n", kind);
 		return 2;
 	}
@@ -305,11 +358,20 @@ int main(int argc, char **argv) {
 	double vox = 1.0;
 	int nt = NT, rc = 0;
 
-	if (!strcmp(kind, "mag")) {
+	if (!strcmp(kind, "mag") || !strcmp(kind, "mag-aniso") || !strcmp(kind, "mag-slab") ||
+	    !strcmp(kind, "mag-tiny")) {
+		// "mag-aniso" is the same data on 1 x 1 x 2.5 mm voxels, where a sphere
+		// measured in mm must reach further in-plane than through-plane; "mag-slab"
+		// on 1 x 1 x 20, where averaging weights across slices underflow float;
+		// "mag-tiny" scaled to ~1e-16 on 1 x 1 x 11, where weight TIMES value does.
+		double scale = 1.0;
+		if (!strcmp(kind, "mag-aniso")) vox_z_scale = 2.5;
+		if (!strcmp(kind, "mag-slab")) vox_z_scale = 20.0;
+		if (!strcmp(kind, "mag-tiny")) { vox_z_scale = 11.0; scale = 1e-19; }
 		// Volume 0 is brightest, so it is the static-phase reference.
 		for (int t = 0; t < NT; t++)
 			for (int v = 0; v < N3; v++)
-				d[t * N3 + v] = (float)((t == 0 ? 900.0 : 500.0) + 100.0 * rng((uint32_t)(t * N3 + v)));
+				d[t * N3 + v] = (float)(scale * ((t == 0 ? 900.0 : 500.0) + 100.0 * rng((uint32_t)(t * N3 + v))));
 	} else if (!strcmp(kind, "mask")) {
 		nt = 1;
 		for (int v = 0; v < N3; v++) d[v] = (v % 3) ? 1.0f : 0.0f;
@@ -344,7 +406,77 @@ int main(int argc, char **argv) {
 		rc = write_nii_dim(argv[3], d, NX - 2, NY, NZ, 1, vox);
 		free(d);
 		return rc;
-	} else if (!strcmp(kind, "big48")) {
+	} else if (!strcmp(kind, "mag-pair")) {
+		// Two volumes, the minimum input: too few noise columns for a sigma.
+		nt = 2;
+		for (int t = 0; t < nt; t++)
+			for (int v = 0; v < N3; v++)
+				d[t * N3 + v] = (float)(500.0 + 100.0 * rng((uint32_t)(t * N3 + v)));
+	} else if (!strcmp(kind, "mag-tall")) {
+		// 9x9x3 x 100: more volumes than the sigma pass's 2N-voxel patch can fit.
+		float *b = (float *)malloc((size_t)N3 * 100 * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < 100; t2++)
+			for (int v = 0; v < N3; v++)
+				b[(size_t)t2 * N3 + v] = (float)(500.0 + 100.0 * rng((uint32_t)(t2 * N3 + v)));
+		rc = write_nii_dim(argv[3], b, NX, NY, NZ, 100, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "mag-thin")) {
+		// One slice: z is clamped to the image, so a sphere's in-plane reach must
+		// grow to find M voxels at a corner.  It once failed outright.
+		const int tnx = 40, tny = 40, tn3 = tnx * tny;
+		float *b = (float *)malloc((size_t)tn3 * 30 * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < 30; t2++)
+			for (int v = 0; v < tn3; v++)
+				b[(size_t)t2 * tn3 + v] = (float)(500.0 + 100.0 * rng((uint32_t)(t2 * tn3 + v)));
+		rc = write_nii_dim(argv[3], b, tnx, tny, 1, 30, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "mag-wide")) {
+		// 40x40x6: the only fixture wide enough that one tile colour of the
+		// averaging scheduler holds several tiles, so a many-thread run really
+		// runs in parallel.  Every 9x9 fixture is one tile per colour.
+		const int wnx = 40, wny = 40, wnz = 6, wn3 = wnx * wny * wnz;
+		float *b = (float *)malloc((size_t)wn3 * NT * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < NT; t2++)
+			for (int v = 0; v < wn3; v++)
+				b[(size_t)t2 * wn3 + v] = (float)(500.0 + 200.0 * sin(0.05 * v + 0.7 * t2) + 100.0 * rng((uint32_t)(t2 * wn3 + v)));
+		rc = write_nii_dim(argv[3], b, wnx, wny, wnz, NT, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "rician") || !strcmp(kind, "rician-clean") || !strcmp(kind, "rician-zero")) {
+		// Low rank at SNR 0.5 to 3 under Rician noise of sigma 100: the floor is
+		// the dominant error, which is what -vst exists for.  "rician-clean" is the
+		// noise-free signal, so a debiased output can be scored against it.  The
+		// Gaussian pairs come from rng() by Box-Muller, so they stay deterministic.
+		// "rician-zero" sets about one sample in 37 to exactly 0 inside otherwise
+		// live voxels, as quantised magnitude can: those must be stabilised with the
+		// rest of their vector, not skipped as background.
+		const int clean = !strcmp(kind, "rician-clean"), zeros = !strcmp(kind, "rician-zero");
+		const int bnz = 5, bnt = 48, bn3 = NX * NY * bnz;
+		float *b = (float *)malloc((size_t)bn3 * bnt * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < bnt; t2++)
+			for (int v = 0; v < bn3; v++) {
+				const double nu = 100.0 * (1.75 + 0.75 * sin(0.21 * v + 0.4 * t2) + 0.5 * cos(0.37 * v));
+				const uint32_t i = (uint32_t)(t2 * bn3 + v) * 4u;
+				const double r1 = sqrt(-2.0 * log(1.0 - rng(i))), r2 = sqrt(-2.0 * log(1.0 - rng(i + 2)));
+				const double a = 100.0 * r1 * cos(2.0 * M_PI * rng(i + 1));
+				const double c = 100.0 * r2 * cos(2.0 * M_PI * rng(i + 3));
+				b[(size_t)t2 * bn3 + v] = (zeros && (t2 * bn3 + v) % 37 == 5) ? 0.0f
+				                        : (float)(clean ? nu : sqrt((nu + a) * (nu + a) + c * c));
+			}
+		rc = write_nii_dim(argv[3], b, NX, NY, bnz, bnt, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "big48") || !strcmp(kind, "big48-clean")) {
 		// The only fixture that reaches the SPLIT eigensolver.  DN_SPLIT_MIN is 48,
 		// so 48 volumes is the smallest count that takes it: values-only tql2,
 		// inverse iteration on the tridiagonal, back-transform through the stored
@@ -360,6 +492,10 @@ int main(int argc, char **argv) {
 		// rank falls as the weaker components drown.  A uniform rank map would be a
 		// near-worthless anchor: any change that still produced one constant would
 		// pass it.
+		//
+		// "big48-clean" is the same signal with no noise: the truth a filter's error
+		// is measured against.
+		const int clean = !strcmp(kind, "big48-clean");
 		const int bnz = 5, bnt = 48, bn3 = NX * NY * bnz;
 		float *b = (float *)malloc((size_t)bn3 * bnt * sizeof(float));
 		if (!b) { free(d); return 2; }
@@ -369,7 +505,7 @@ int main(int argc, char **argv) {
 				double s = 1000.0;
 				for (int c = 1; c <= 3; c++)
 					s += (400.0 / c) * sin(0.13 * c * v + 0.31 * c * t2);
-				b[(size_t)t2 * bn3 + v] = (float)(s + noise * (rng((uint32_t)(t2 * bn3 + v)) - 0.5));
+				b[(size_t)t2 * bn3 + v] = (float)(s + (clean ? 0.0 : noise * (rng((uint32_t)(t2 * bn3 + v)) - 0.5)));
 			}
 		rc = write_nii_dim(argv[3], b, NX, NY, bnz, bnt, vox);
 		free(b);
