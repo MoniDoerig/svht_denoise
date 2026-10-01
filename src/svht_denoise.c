@@ -40,7 +40,7 @@ static const char *pf_note(double pf) {
 // converge on the true sigma but overshoots it (64 against 60 after six).
 #define DN_VST_ROUNDS 2
 
-#define DN_VERSION "0.1.20260928"
+#define DN_VERSION "0.1.20261001"
 
 // -degibbs: no, yes (after denoising), or only (instead of denoising).
 enum { DN_DG_NO = 0, DN_DG_YES, DN_DG_ONLY };

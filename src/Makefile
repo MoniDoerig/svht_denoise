@@ -413,7 +413,7 @@ verbose:
 # `$(DN_VERSION_H)` is frozen as those nine literal characters and the release
 # ships an empty version.  Keeping the number here is the safe half of that
 # trade; bump both when it changes.
-VERSION ?= 0.1.20260928
+VERSION ?= 0.1.20261001
 MACOS_SIGN_IDENTITY ?=
 MACOS_INSTALLER_IDENTITY ?=
 NOTARY_PROFILE ?= svht-denoise-notary
